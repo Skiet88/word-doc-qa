@@ -19,8 +19,8 @@ No Python, no pip, no conda — pure Rust.
 ## Getting the Code
 
 ```bash
-git clone https://github.com/Skiet88/word-doc-qa-burn.git
-cd word-doc-qa-burn
+git clone https://github.com/Skiet88/word-doc-qa.git
+cd word-doc-qa
 ```
 
 ---
