@@ -126,7 +126,9 @@ const STOP_WORDS: &[&str] = &[
     "should", "may", "might", "can", "could", "in", "on", "at", "to",
     "for", "of", "and", "or", "but", "if", "with", "by", "from", "this",
     "that", "it", "its", "how", "what", "when", "where", "who", "which",
-    "many", "much", "some", "any", "all", "their", "there", "here",
+    // NOTE: "many" is intentionally NOT listed here — it is a discriminative
+    // word in "how many" count queries and must survive the stop-word filter.
+    "much", "some", "any", "all", "their", "there", "here",
     "about", "into", "than", "then", "also", "each", "per",
 ];
 
@@ -136,13 +138,16 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("graduation",   &["graduation", "graduate", "graduates", "ceremony", "commencement", "summer graduation", "autumn graduation"]),
     ("ceremony",     &["ceremony", "graduation", "commencement"]),
     ("summer",       &["summer", "december", "summer graduation"]),
-    // "year" in a graduation context maps to the summer/end-of-year ceremony.
-    ("year",         &["year", "summer", "december", "annual"]),
+    // "year" on its own should NOT pull in December — that caused "When does the
+    // academic year begin?" to rank December paragraphs above January ones.
+    // End-of-year graduation is handled by the "graduation"/"summer" synonyms.
+    ("year",         &["year", "annual"]),
     ("end",          &["end", "summer", "december", "final"]),
     ("autumn",       &["autumn", "fall", "april", "autumn graduation"]),
     ("workers",      &["workers", "labour", "labor"]),
     ("labour",       &["labour", "workers", "labor"]),
-    ("holiday",      &["holiday", "recess", "public"]),
+    ("holiday",      &["holiday", "holidays", "recess", "public", "national", "day"]),
+    ("holidays",     &["holidays", "holiday", "recess", "public", "national", "day"]),
     ("exam",         &["exam", "examination", "assessment", "assessments", "examination question"]),
     ("examination",  &["exam", "examination", "assessment", "assessments"]),
     ("registration", &["registration", "enrolment", "enrollment", "start of term", "wced schools open"]),
@@ -170,7 +175,7 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     // Classes / start of term
     ("classes",      &["classes", "start of term", "schools open"]),
     ("start",        &["start", "start of term", "first day", "begin"]),
-    ("begin",        &["begin", "start of term", "first day"]),
+    ("begin",        &["begin", "start", "start of term", "start of year", "first day"]),
     ("open",         &["open", "schools open", "start of term"]),
     ("close",        &["close", "schools close", "end of term"]),
     // Christmas / December recess
@@ -181,8 +186,31 @@ const SYNONYMS: &[(&str, &[&str])] = &[
     ("good",         &["good", "good friday", "easter"]),
     ("friday",       &["friday", "good friday"]),
     // Public holidays general
-    ("public",       &["public", "holiday", "day"]),
+    ("public",       &["public", "holiday", "holidays", "day"]),
     ("june",         &["june", "winter", "youth day"]),
+    // ── Count / frequency queries ────────────────────────────────────────────
+    // "how many times" / "how often" should match meeting/session paragraphs.
+    ("many",         &["many", "times", "number", "count", "total", "often"]),
+    ("times",        &["times", "many", "often", "frequency", "occurrences", "sessions", "meetings"]),
+    ("often",        &["often", "times", "many", "frequently", "regularly"]),
+    ("count",        &["count", "number", "total", "many"]),
+    ("meeting",      &["meeting", "meetings", "session", "sessions", "board", "committee", "forum"]),
+    ("meetings",     &["meetings", "meeting", "sessions", "board", "committee", "forum"]),
+    ("board",        &["board", "committee", "governance", "management", "council", "forum"]),
+    ("governance",   &["governance", "board"]),
+    // Handles common document typo: "SARETEC" instead of "SARTEC".
+    ("sartec",       &["sartec", "saretec"]),
+    ("saretec",      &["sartec", "saretec"]),
+    // ── Committee acronyms ──────────────────────────────────────────────────
+    ("hdc",          &["hdc", "higher degrees committee", "higher degrees"]),
+    ("higher",       &["higher", "hdc", "higher degrees"]),
+    // ── Duration queries ─────────────────────────────────────────────────────
+    // "how long is the first semester" → look for term-start/end paragraphs.
+    ("long",         &["long", "duration", "length", "weeks", "days", "months", "period"]),
+    ("duration",     &["duration", "long", "length", "period", "weeks", "days"]),
+    ("length",       &["length", "duration", "long", "weeks", "period"]),
+    ("weeks",        &["weeks", "week", "days", "duration", "long", "period"]),
+    ("days",         &["days", "day", "weeks", "duration", "period"]),
 ];
 
 // ── Academic calendar phrase normalisation ────────────────────────────────────
@@ -213,6 +241,10 @@ const PHRASE_REWRITES: &[(&str, &str)] = &[
     ("end of semester",    "end of term"),
     ("semester start",     "start of term"),
     ("semester end",       "end of term"),
+    // ── Committee acronym expansions ─────────────────────────────────────
+    // Expand before keyword scoring so entity extraction and matching both
+    // see the full committee name that appears in the calendar documents.
+    ("hdc",                "higher degrees committee"),
 ];
 
 /// Rewrite a raw question string so that multi-word academic-calendar phrases
@@ -341,12 +373,22 @@ fn keyword_relevance(question: &str, paragraph: &str) -> f32 {
         .count() as f32 * 0.5;
     score += pair_bonus;
 
-    // Committee-meeting penalty: when the query is about an event/date and the
-    // paragraph is a committee/planning entry, reduce score by 0.4.
+    // Committee-meeting penalty: when the query is about an event/date (but is
+    // NOT a count/frequency/meeting query itself) and the paragraph is a
+    // committee/planning entry, reduce score by 0.4.
     // This prevents "Graduation Planning Committee" rows from outranking
     // "SUMMER GRADUATION" event rows.
+    //
+    // EXCEPTION: "how many times", "how often", "meeting", "board" queries are
+    // explicitly *seeking* committee-meeting paragraphs, so the penalty must
+    // not fire for them.
+    const COUNT_WORDS: &[&str] = &[
+        "many", "times", "often", "count", "number", "meetings", "meeting",
+        "board", "sessions", "session", "governance", "forum",
+    ];
     let query_wants_event = q_words.iter().any(|w| EVENT_WORDS.contains(&w.as_str()));
-    if query_wants_event && para_lower.contains("committee") {
+    let query_wants_count = q_words.iter().any(|w| COUNT_WORDS.contains(&w.as_str()));
+    if query_wants_event && !query_wants_count && para_lower.contains("committee") {
         score -= 0.4;
     }
 
@@ -622,9 +664,15 @@ fn best_cell(question: &str, paragraph: &str) -> String {
 
                     // Only produce a range when leftward expansion actually occurred
                     // (i.e. the bar genuinely spans multiple days starting before
-                    // the anchor cell).  Single-day events like FREEDOM DAY must
-                    // not be extended to the end of the week row.
-                    if range_start < anchor_day {
+                    // the anchor cell).  Single-day events like FREEDOM DAY or
+                    // CHRISTMAS DAY must not be extended to the end of the week row.
+                    //
+                    // Guard: if the event text ends with the word "DAY" it is a
+                    // single-day public holiday — never expand regardless of how
+                    // many bare cells precede it in the week row.
+                    let last_word = event.split_whitespace().next_back().unwrap_or("");
+                    let is_single_day_holiday = last_word.eq_ignore_ascii_case("day");
+                    if range_start < anchor_day && !is_single_day_holiday {
                         format!("{}-{} {}", range_start, max_day, event)
                     } else {
                         // No leftward expansion — single-day event.
@@ -841,6 +889,535 @@ fn enrich_doc_paragraphs(
     result
 }
 
+// ── Matched-event segment extraction ─────────────────────────────────────────
+
+/// Given an entity query (e.g. `"SARTEC Governance"`) and a raw calendar cell
+/// body (e.g. `"International Women's Day SARETEC Governance Board Meeting (09:00)"`),
+/// return only the sub-string that is the matched event, including its time
+/// indicator if present — and nothing before or after it.
+///
+/// Examples:
+///   entity = "SARTEC Governance"
+///   cell   = "International Women's Day SARETEC Governance Board Meeting (09 :00)"
+///   result = "SARETEC Governance Board Meeting (09 :00)"
+///
+///   entity = "SARTEC Governance"
+///   cell   = "SARETEC Governance Board Meeting (09:00) Waste & Recycling Awareness Campaign"
+///   result = "SARETEC Governance Board Meeting (09:00)"
+///
+///   entity = "Senate"
+///   cell   = "Senate (12:00) Waste & Recycling Awareness Campaign"
+///   result = "Senate (12:00)"
+fn extract_matched_event(entity_query: &str, cell_body: &str) -> String {
+    if entity_query.trim().is_empty() {
+        return cell_body.trim().to_string();
+    }
+
+    let cell_lower = cell_body.to_lowercase();
+    let entity_words: Vec<&str> = entity_query.split_whitespace().collect();
+
+    // ── Strategy: find the position in the cell where the entity phrase starts.
+    //
+    // We try to match the entity as a "phrase" (all words appearing together in
+    // order) to avoid anchoring on an unrelated earlier occurrence of a shared
+    // word like "governance" appearing in "Council Governance and Ethics
+    // Committee" before "SARETEC Governance Board Meeting".
+    //
+    // Step 1: Build candidate surface forms for each entity word.
+    //   For spelling-variant synonyms (sartec/saretec) we include them.
+    //   We do NOT include broad semantic synonyms (governance→board) here
+    //   because those would anchor on the wrong event.
+    let word_candidates: Vec<Vec<String>> = entity_words.iter().map(|w| {
+        let wl = w.to_lowercase();
+        // Only include the word itself plus synonyms that are recognisably
+        // the same surface form (length within ±2 chars).
+        let mut cands = vec![wl.clone()];
+        for syn in synonym_expand(&wl) {
+            let sl = syn.to_lowercase();
+            let len_diff = (sl.len() as isize - wl.len() as isize).unsigned_abs();
+            if len_diff <= 2 {
+                cands.push(sl);
+            }
+        }
+        cands
+    }).collect();
+
+    // Step 2: Scan cell_lower byte-by-byte to find a span where EACH entity
+    // word (in order) appears, allowing arbitrary text between consecutive
+    // words (they just must appear in left-to-right order with no backtracking).
+    // We report the start position of the FIRST word match.
+    let start_pos: Option<usize> = {
+        let mut best: Option<usize> = None;
+        // Try every occurrence of the first entity word as a possible anchor.
+        for first_cand in &word_candidates[0] {
+            let mut search_from = 0;
+            while let Some(rel) = cell_lower[search_from..].find(first_cand.as_str()) {
+                let anchor = search_from + rel;
+                // Try to match remaining words in order after anchor.
+                let mut pos = anchor + first_cand.len();
+                let mut all_match = true;
+                for cands in &word_candidates[1..] {
+                    // Find the earliest occurrence of any candidate for this word.
+                    let found = cands.iter().filter_map(|c| {
+                        cell_lower[pos..].find(c.as_str()).map(|r| (r, c.len()))
+                    }).min_by_key(|(r, _)| *r);
+                    match found {
+                        Some((r, clen)) => pos += r + clen,
+                        None => { all_match = false; break; }
+                    }
+                }
+                if all_match {
+                    best = Some(match best {
+                        None    => anchor,
+                        Some(p) => p.min(anchor),
+                    });
+                    break; // first (leftmost) occurrence of this candidate is enough
+                }
+                search_from = anchor + 1;
+            }
+        }
+        best
+    };
+
+    // Byte offset where the matched event starts (fallback: beginning of cell).
+    let start = {
+        let s = start_pos.unwrap_or(0);
+        // Ensure valid UTF-8 boundary.
+        let mut s2 = s;
+        while s2 > 0 && !cell_body.is_char_boundary(s2) { s2 -= 1; }
+        s2
+    };
+
+    let from_start = &cell_body[start..];
+
+    // Find the end: include up to and including the closing paren of the
+    // first time indicator `(…:…)` or `(@…:…)`.
+    let end = {
+        let len = from_start.len();
+        let mut result = len;
+        let mut i = 0;
+        let chars: Vec<char> = from_start.chars().collect();
+        let char_count = chars.len();
+        while i < char_count {
+            if chars[i] == '(' {
+                // Collect inner text up to matching ')'.
+                let open_byte = from_start
+                    .char_indices()
+                    .nth(i)
+                    .map(|(b, _)| b)
+                    .unwrap_or(len);
+                if let Some(close_rel) = from_start[open_byte..].find(')') {
+                    let inner = &from_start[open_byte + 1..open_byte + close_rel];
+                    let inner_t = inner.trim().trim_start_matches('@');
+                    let is_time = inner_t.contains(':')
+                        && inner_t.chars().any(|c| c.is_ascii_digit());
+                    if is_time {
+                        result = open_byte + close_rel + 1;
+                        break;
+                    }
+                }
+            }
+            i += 1;
+        }
+        result
+    };
+
+    from_start[..end].trim().to_string()
+}
+
+// ── Count / frequency aggregation ────────────────────────────────────────────
+
+/// Return `true` when the question is asking for a count or frequency rather
+/// than a specific date span.
+///
+/// Matches patterns like:
+///   "How many times does X meet?"
+///   "How many board meetings does Y have?"
+///   "How often does Z occur?"
+/// Returns `true` when the question asks how many times the entity *itself*
+/// meets ("how many times does X meet"), as opposed to a typed query like
+/// "how many board meetings does X have".
+fn is_self_meeting_query(question: &str) -> bool {
+    let lower = question.to_lowercase();
+    let wants_count = lower.contains("how many times") || lower.contains("how often");
+    let has_type = lower.contains("board meeting")
+        || lower.contains("committee meeting")
+        || lower.contains("governance board");
+    wants_count && !has_type
+}
+
+/// Extract a meeting-type qualifier that the user explicitly named.
+///
+/// "how many board meetings does SARTEC Governance have?" → `Some("board")`
+/// "how many governance board meetings?"                  → `Some("governance board")`
+/// "how many times does the Senate meet?"                 → `None`
+fn meeting_type_qualifier(question: &str) -> Option<String> {
+    let lower = question.to_lowercase();
+    if lower.contains("governance board") {
+        return Some("governance board".into());
+    }
+    if lower.contains("board meeting") || lower.contains("board meetings") {
+        return Some("board".into());
+    }
+    if lower.contains("committee meeting") || lower.contains("committee meetings") {
+        return Some("committee".into());
+    }
+    None
+}
+
+fn is_count_query(question: &str) -> bool {
+    let lower = question.to_lowercase();
+    // Any question that contains "how many" is a count / aggregation query.
+    // Examples:
+    //   "how many board meetings does SARTEC Governance have?"
+    //   "how many times does the Senate meet?"
+    //   "how many public holidays are in April 2026?"
+    if lower.contains("how many") || lower.contains("how often") {
+        return true;
+    }
+    false
+}
+
+/// Strip question-structure words from a count query, leaving only the entity
+/// / subject words that should be searched for in the documents.
+///
+/// E.g.:
+///   "How many times does the Senate meet in 2026?"
+///       → "senate"
+///   "How many board meetings does SARTEC Governance have?"
+///       → "sartec governance"   ("board" and "meetings" are type-descriptors, not identifiers)
+///   "How often does the Supply Chain Management Committee meet?"
+///       → "supply chain management committee"
+fn count_query_entity(question: &str) -> String {
+    // ── Strategy: detect query pattern and extract the entity ─────────────────
+    //
+    // Pattern A – "how many [TYPE] does/do/did [ENTITY] have/meet/hold?"
+    //   → entity = words AFTER does/do/did, TYPE are the words before it.
+    //   → "how many board meetings does SARTEC Governance have?"
+    //       → entity = "SARTEC Governance"
+    //
+    // Pattern B – "how many [TYPE] are/is/were [in/there] [TIME PERIOD]?"
+    //   → entity = TYPE (the thing being counted), TIME PERIOD is a constraint.
+    //   → "how many public holidays are in April 2026?"
+    //       → entity = "public holidays"
+    //
+    // Pattern C – "how many times does [ENTITY] meet/occur/happen?"
+    //   → entity = ENTITY (falls under Pattern A).
+    //
+    // Falls back to stripping structural words when no pivot is found.
+    let lower = question.to_lowercase();
+    let words_lower: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != ' ')
+        .flat_map(|chunk| chunk.split_whitespace())
+        .collect();
+    let orig_words: Vec<&str> = question
+        .split(|c: char| !c.is_alphanumeric() && c != ' ')
+        .flat_map(|chunk| chunk.split_whitespace())
+        .collect();
+
+    // Trailing predicate / action words (appear at the end, after the entity).
+    const TRAILING: &[&str] = &[
+        "have", "has", "hold", "held", "meet", "meets", "occur", "occurs",
+        "happen", "happens", "take", "takes", "schedule", "schedules",
+        "convene", "convenes", "run", "runs", "in", "per", "year", "annually",
+    ];
+
+    // Detect pivot: find "does/do/did" (Pattern A) or "are/is/were" (Pattern B).
+    let does_pivot = words_lower.iter().position(|w| matches!(*w, "does" | "do" | "did"));
+    let are_pivot  = words_lower.iter().position(|w| matches!(*w, "are" | "is" | "were"));
+    // "does/do/did" takes priority (Pattern A is more precise).
+    let pivot_kind: Option<(usize, bool)> = match (does_pivot, are_pivot) {
+        (Some(d), _)    => Some((d, false)),  // false = Pattern A (entity after pivot)
+        (None, Some(a)) => Some((a, true)),   // true  = Pattern B (entity before pivot)
+        _               => None,
+    };
+
+    let entity_tokens: Vec<String> = if let Some((p, pattern_b)) = pivot_kind {
+        if pattern_b {
+            // Pattern B: "how many [TYPE] are/is [in/there] [TIME]?"
+            // Entity = TYPE words between "many" and the pivot.
+            let many_pos = words_lower.iter().position(|w| *w == "many").unwrap_or(0);
+            orig_words[many_pos + 1..p]
+                .iter()
+                .copied()
+                .filter(|w| {
+                    let wl = w.to_lowercase();
+                    !matches!(wl.as_str(), "the" | "a" | "an")
+                        && !(w.len() == 4 && w.chars().all(|c| c.is_ascii_digit()))
+                })
+                .map(str::to_string)
+                .collect()
+        } else {
+        // Pattern A: entity is AFTER the pivot.
+        // Words after the pivot preserve casing.
+        let after: Vec<&str> = orig_words
+            .iter()
+            .skip(p + 1)
+            .copied()
+            .collect();
+        // Strip leading determiners "the", "a", "an".
+        let after = {
+            let skip = after.iter()
+                .take_while(|w| matches!(w.to_lowercase().as_str(), "the" | "a" | "an"))
+                .count();
+            &after[skip..]
+        };
+        // Take words until a trailing predicate is encountered.
+        after.iter()
+            .copied()
+            .take_while(|w| !TRAILING.contains(&w.to_lowercase().as_str()))
+            .filter(|w| {
+                // Drop bare 4-digit years.
+                !(w.len() == 4 && w.chars().all(|c| c.is_ascii_digit()))
+            })
+            .map(str::to_string)
+            .collect()
+        }
+    } else {
+        // Fallback: strip every known structural word.
+        const STRIP: &[&str] = &[
+            "how", "many", "times", "often", "does", "do", "did", "the", "a", "an",
+            "meet", "meets", "meeting", "meetings", "board", "boards",
+            "have", "has", "hold", "held", "occur",
+            "occurs", "occurrences", "sessions", "session", "convene", "convenes",
+            "please", "tell", "much", "there", "are", "is",
+            "what", "when", "where", "who", "which", "why",
+            "in", "on", "at", "to", "for", "of", "and", "or", "by", "from",
+            "its", "it", "this", "that",
+        ];
+        question
+            .split(|c: char| !c.is_alphanumeric() && c != ' ')
+            .flat_map(|chunk| chunk.split_whitespace())
+            .filter(|w| {
+                let wl = w.to_lowercase();
+                if STRIP.contains(&wl.as_str()) { return false; }
+                if w.len() == 4 && w.chars().all(|c| c.is_ascii_digit()) { return false; }
+                true
+            })
+            .map(str::to_string)
+            .collect()
+    };
+
+    entity_tokens.join(" ")
+}
+
+/// For Pattern B count queries ("how many X are in MONTH YEAR?"), extract the
+/// month number the user is asking about.
+///
+/// "how many public holidays are in April 2026?" → `Some(4)`
+/// "how many board meetings does SARTEC have?"   → `None`
+fn count_scope_month(question: &str) -> Option<u32> {
+    let lower = question.to_lowercase();
+    // Only applies when there is NO "does/do/did" pivot (Pattern B queries).
+    let has_does = lower.split_whitespace().any(|w| matches!(w, "does" | "do" | "did"));
+    if has_does {
+        return None;
+    }
+    // Look for a month name anywhere in the question.
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    for w in &words {
+        if let Some(m) = month_name_to_number(w) {
+            return Some(m);
+        }
+    }
+    None
+}
+
+/// Extract a type-qualifier word from a count query that should serve as a
+/// **hard mandatory filter** on matched cells.
+///
+/// For "how many board meetings does SARTEC Governance have?" the type term
+/// is "board" — matched cells must contain "board" so that generic entries
+/// like "Council Governance and Ethics Committee" are excluded.
+///
+/// Returns `None` when no specific type qualifier is present (e.g. "how many
+/// times does X meet?"), meaning no additional cell filter is applied.
+fn count_type_qualifier(question: &str) -> Option<String> {
+    // Generic count words that are NOT meaningful type qualifiers.
+    const GENERIC: &[&str] = &["times", "time", "often", "many", "occurrences",
+                                "instances", "sessions", "session"];
+
+    let lower = question.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != ' ')
+        .flat_map(|chunk| chunk.split_whitespace())
+        .collect();
+
+    let many_pos  = words.iter().position(|w| *w == "many")?;
+
+    // Pattern B: "how many X are/is in Y?" → entity = X, no extra qualifier
+    // needed (X itself IS the type we're counting).
+    let has_does = words[many_pos..].iter().any(|w| matches!(*w, "does" | "do" | "did"));
+    if !has_does {
+        return None;
+    }
+
+    // Pattern A: "how many TYPE does ENTITY have?" → extract TYPE qualifier.
+    let pivot_pos = words[many_pos..].iter()
+        .position(|w| matches!(*w, "does" | "do" | "did"))
+        .map(|p| many_pos + p)?;
+
+    // Type words are between "many" and the pivot.
+    let type_words: Vec<&str> = words[many_pos + 1..pivot_pos]
+        .iter()
+        .copied()
+        .filter(|w| !GENERIC.contains(w))
+        .collect();
+
+    if type_words.is_empty() {
+        return None;
+    }
+
+    // Return the most specific (first non-generic) type word as the qualifier.
+    Some(type_words[0].to_string())
+}
+
+/// Scan `search_pool` for every calendar *cell* that mentions the entity
+/// described by `entity_query`.
+///
+/// Uses `keyword_relevance` (with synonym expansion) to match both the
+/// individual week-row paragraph AND the individual cell within that row,
+/// so broad terms like "Senate" correctly enumerate each Senate meeting
+/// while narrow terms like "SARTEC Governance" pick up the specific entry
+/// despite minor spelling variations.
+///
+/// Returns `(total_count, Vec<pretty_date_string>)`.
+fn count_occurrences(
+    entity_query: &str,
+    question: &str,
+    search_pool: &[&(String, String, Option<u32>)],
+    scope_month: Option<u32>,
+) -> (usize, Vec<String>) {
+    if entity_query.trim().is_empty() {
+        return (0, vec![]);
+    }
+
+    // Threshold: para-level is used as a coarse pre-filter (synonym expansion
+    // allowed).  Cell-level scoring requires ≥70 % of entity words matched
+    // directly or via synonym — strict enough to avoid false positives from
+    // broad synonym chains (e.g. "governance" → "board") while still catching
+    // spelling variants like "SARETEC" (matches "sartec" via synonym).
+    const PARA_THRESHOLD: f32 = 0.45;
+    const CELL_THRESHOLD: f32 = 0.70;
+
+    // ── Precision flags derived from the original question ────────────────
+    // self_meeting: "how many times does X meet?"  → entity must be the
+    //   primary subject of the cell (appear at the start, directly followed
+    //   by a time indicator like "(12:00)"), so sub-committees of X are
+    //   excluded.
+    let self_meeting = is_self_meeting_query(question);
+    // type_qualifier: the specific type word extracted from the question
+    // (e.g. "board" from "how many board meetings does X have?").
+    // Applied as a hard cell filter to exclude false-positive matches.
+    let type_qualifier: Option<String> = count_type_qualifier(question);
+
+    let mut dates: Vec<String> = Vec::new();
+
+    for (para, _doc, _yr) in search_pool.iter().copied() {
+        // Fast paragraph-level filter.
+        if keyword_relevance(entity_query, para) < PARA_THRESHOLD {
+            continue;
+        }
+
+        let prefix   = month_prefix(para.as_str()).map(str::to_string);
+        let content  = strip_month_prefix(para.as_str());
+
+        // Scope-month filter: if the query asked about a specific month
+        // (e.g. "in April"), only count entries from that month.
+        if let Some(sm) = scope_month {
+            let para_month = prefix.as_deref()
+                .and_then(parse_month_year)
+                .map(|(m, _)| m);
+            match para_month {
+                Some(pm) if pm == sm => { /* in scope – continue */ }
+                _ => continue,
+            }
+        }
+
+        // Walk cells in the week row.
+        let cells: Vec<&str> = content
+            .split(" | ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter(|s| !is_weekday_row(s))
+            .collect();
+
+        for cell in cells {
+            // Skip bare day-number cells (no event text).
+            if cell.trim().chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if keyword_relevance(entity_query, cell) < CELL_THRESHOLD {
+                continue;
+            }
+
+            // ── Self-meeting precision filter ────────────────────────────
+            // "how many times does the Senate meet?"  →  the entity name must
+            // appear at the *start* of the cell body (after any leading day
+            // number) and be followed directly by a time indicator "(hh:mm)"
+            // or "(@hh:mm)", with nothing else between.  This excludes cells
+            // like "Senate Higher Degrees Committee (09:00)" whose primary
+            // subject is the sub-committee, not the Senate itself.
+            //
+            // EXCEPTION: when the entity itself is a multi-word specific name
+            // (≥ 3 words, e.g. "higher degrees committee"), the starts-with
+            // guard is too strict — the entity may appear after a short prefix
+            // like "Senate " in the cell body.  In that case keyword_relevance
+            // at CELL_THRESHOLD already ensures precision; we skip the guard.
+            if self_meeting && entity_query.split_whitespace().count() <= 2 {
+                let cell_body: &str = match split_day_from_cell(cell) {
+                    Some((_, rest)) => rest,
+                    None            => cell,
+                };
+                let entity_lower   = entity_query.to_lowercase();
+                let cell_body_lower = cell_body.to_lowercase();
+                let direct = cell_body_lower.starts_with(&entity_lower) && {
+                    let after = cell_body[entity_lower.len()..].trim();
+                    after.is_empty() || after.starts_with('(') || after.starts_with('@')
+                };
+                if !direct {
+                    continue;
+                }
+            }
+
+            // ── Type qualifier hard filter ────────────────────────────────
+            // "how many board meetings does SARTEC Governance have?" → only
+            // keep cells that explicitly contain the type qualifier word
+            // (e.g. "board").  This removes false positives like
+            // "Council Governance and Ethics Committee" (no "board") while
+            // correctly keeping "SARETEC Governance Board Meeting".
+            // When no specific qualifier was found in the question (e.g. "how
+            // many times does X meet?") no extra filter is applied.
+            if let Some(ref q) = type_qualifier {
+                if !cell.to_lowercase().contains(q.as_str()) {
+                    continue;
+                }
+            }
+
+            // Format a human-readable date, showing ONLY the matched event
+            // segment (not the full cell which may include unrelated events).
+            let cell_for_date: String = match split_day_from_cell(cell) {
+                Some((day_str, body)) => {
+                    let segment = extract_matched_event(entity_query, body);
+                    format!("{} {}", day_str, segment)
+                }
+                None => extract_matched_event(entity_query, cell),
+            };
+            let formatted = match &prefix {
+                Some(p) => pretty_date(p, &cell_for_date),
+                None    => cell_for_date,
+            };
+            dates.push(formatted);
+        }
+    }
+
+    let count = dates.len();
+    (count, dates)
+}
+
 // ── Interactive CLI loop ──────────────────────────────────────────────────────
 
 /// Load model from `model_dir`, extract context from .docx files in `docs_dir`,
@@ -908,6 +1485,69 @@ pub fn run_inference(docs_dir: &Path, model_dir: &Path) {
                 }
             })
             .collect();
+
+        // ── Step 1b: count / frequency shortcut ───────────────────────────
+        // "How many times does X meet?" / "How often does Y occur?" →
+        // aggregate matching cells across all paragraphs instead of
+        // extracting a single span.
+        if is_count_query(question) {
+            // Expand acronyms / phrase rewrites before entity extraction so
+            // that e.g. "HDC" → "Higher Degrees Committee" is resolved.
+            // The original question is kept for behavioural flags (self_meeting,
+            // type_qualifier, scope_month) to avoid changing query semantics.
+            let norm_q = normalize_question(question);
+            let entity = count_query_entity(&norm_q);
+            let scope_month = count_scope_month(question);
+            let (count, dates) = count_occurrences(&entity, question, &search_pool, scope_month);
+            let year_label = {
+                const MONTH_NAMES_DISP: [&str; 12] = [
+                    "January","February","March","April","May","June",
+                    "July","August","September","October","November","December",
+                ];
+                let month_part = scope_month
+                    .map(|m| format!(" in {}", MONTH_NAMES_DISP[(m - 1) as usize]))
+                    .unwrap_or_default();
+                // When there is no month scope, add "in" before the year.
+                let year_part = query_year.map(|y| {
+                    if scope_month.is_none() { format!(" in {y}") }
+                    else                     { format!(" {y}") }
+                }).unwrap_or_default();
+                format!("{month_part}{year_part}")
+            };
+            let entity_label = if entity.is_empty() {
+                "the subject".to_string()
+            } else {
+                // Title-case the entity label for display.
+                entity.split_whitespace()
+                    .map(|w| {
+                        let mut c = w.chars();
+                        match c.next() {
+                            None    => String::new(),
+                            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            if count == 0 {
+                println!(
+                    "\n\x1b[33mAnswer\x1b[0m [count]: No occurrences of \"{entity_label}\" found{year_label}.\n"
+                );
+            } else {
+                println!(
+                    "\n\x1b[32;1mAnswer\x1b[0m [count]: \"{entity_label}\" appears \x1b[1m{count}\x1b[0m time(s){year_label}:"
+                );
+                let show = dates.len().min(25);
+                for (i, d) in dates.iter().take(show).enumerate() {
+                    println!("  {:2}. {}", i + 1, d);
+                }
+                if dates.len() > show {
+                    println!("  … and {} more.", dates.len() - show);
+                }
+                println!();
+            }
+            continue; // skip the normal QA pipeline
+        }
 
         // ── Step 2: rank filtered paragraphs by keyword relevance ─────────
         // Exclude pure weekday-header rows from participation.

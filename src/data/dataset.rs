@@ -119,24 +119,108 @@ fn make_qa_triple(paragraph: &str) -> Vec<(String, String, String)> {
     }
 
     // ── Strategy 2: Count / number questions ─────────────────────────────────
-    // For every sentence that contains a digit, generate "How many …?" question.
+    // For every sentence that contains a digit, generate varied count /
+    // frequency / duration questions so the model sees real-world "How many",
+    // "How often", and "How long" query patterns.
     for &sent in &sentences {
         let words: Vec<&str> = sent.split_whitespace().collect();
         for (i, word) in words.iter().enumerate() {
             if word.chars().any(|c| c.is_ascii_digit()) {
-                let unit = words.get(i + 1).copied().unwrap_or("items");
-                let ctx  = words.get(i.saturating_sub(2)).copied().unwrap_or("there");
+                // The word immediately after the number is typically the unit
+                // ("times", "days", "weeks", "meetings", …).
+                let unit  = words.get(i + 1).copied().unwrap_or("items");
+                // Two words before the number give subject context.
+                let subj  = words.get(i.saturating_sub(2)).copied().unwrap_or("this");
+                // Topic: first few non-trivial words of the sentence.
+                let topic: String = words.iter()
+                    .filter(|w| w.len() > 3)
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                // "How many X are there?" — generic count
                 triples.push((
-                    format!("How many {} {}?", unit, ctx),
+                    format!("How many {} are there?", unit),
                     paragraph.to_string(),
                     sent.to_string(),
                 ));
-                break; // one number question per sentence is enough
+                // "How many times did … ?" — frequency pattern
+                triples.push((
+                    format!("How many times does {} occur?", subj),
+                    paragraph.to_string(),
+                    sent.to_string(),
+                ));
+                // "How often …?" — frequency synonym
+                if !topic.is_empty() {
+                    triples.push((
+                        format!("How often does {}?", topic),
+                        paragraph.to_string(),
+                        sent.to_string(),
+                    ));
+                }
+                // Duration pattern: "How long is …?" / "How many days/weeks …?"
+                // Detect whether the unit following the number is a time unit
+                // (singular or plural) — e.g. "day", "days", "week", "weeks".
+                let unit_stem = unit.to_lowercase();
+                let unit_stem = unit_stem.trim_end_matches('s'); // "days"→"day", "weeks"→"week"
+                let is_duration_unit = matches!(
+                    unit_stem,
+                    "day" | "week" | "month" | "hour" | "minute" | "year" | "period"
+                );
+                if is_duration_unit {
+                    triples.push((
+                        format!("How long is {}?", topic),
+                        paragraph.to_string(),
+                        sent.to_string(),
+                    ));
+                    triples.push((
+                        format!("How many {} does {} last?", unit, subj),
+                        paragraph.to_string(),
+                        sent.to_string(),
+                    ));
+                }
+                break; // one question-cluster per sentence is enough
             }
         }
     }
 
-    // ── Strategy 3: General topic questions ──────────────────────────────────
+    // ── Strategy 3: Duration / span questions from term-start/end paragraphs ─
+    // When a paragraph mentions both a start and an end (or a recess range),
+    // generate "How long is the X?" questions so the model is exposed to
+    // duration queries during training.
+    {
+        let has_start = lower.contains("start of term") || lower.contains("start of year")
+            || lower.contains("schools open") || lower.contains("begin");
+        let has_end   = lower.contains("end of term") || lower.contains("schools close")
+            || lower.contains("end of year");
+        let has_weeks = lower.contains("week") || lower.contains("days") || lower.contains("month");
+
+        if (has_start && has_end) || has_weeks {
+            let subject: String = sentences[0]
+                .split_whitespace()
+                .filter(|w| w.len() > 3)
+                .take(4)
+                .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+                .filter(|w| !w.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !subject.is_empty() {
+                triples.push((
+                    format!("How long is {}?", subject),
+                    paragraph.to_string(),
+                    sentences[0].to_string(),
+                ));
+                triples.push((
+                    format!("What is the duration of {}?", subject),
+                    paragraph.to_string(),
+                    sentences[0].to_string(),
+                ));
+            }
+        }
+    }
+
+    // ── Strategy 4: General topic questions ──────────────────────────────────
     if sentences.len() >= 2 {
         let key_words: String = sentences[1]
             .split_whitespace()
@@ -154,7 +238,7 @@ fn make_qa_triple(paragraph: &str) -> Vec<(String, String, String)> {
             ));
         }
     } else {
-        // ── Strategy 4: Single-sentence fallback ─────────────────────────────
+        // ── Strategy 5: Single-sentence fallback ─────────────────────────────
         let words: Vec<&str> = paragraph.split_whitespace().collect();
         let ans = words[..8.min(words.len())].join(" ");
         triples.push((
